@@ -1,6 +1,6 @@
 const express = require('express');
 const path = require('path');
-const { DualSideExecutor } = require('../lib/dualSideExecutor');
+const { StrategyRunner } = require('../lib/strategyRunner');
 const { buildExecutionPlan } = require('../lib/executionCalculator');
 const {
   calculateStake,
@@ -11,12 +11,25 @@ const {
 const config = require('../../config/primacy.config');
 
 const app = express();
-const PORT = process.env.BOT_PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
 let accountBalance = 1000;
 let tradeHistory = [];
 let currentPlan = null;
-let dualExecutor = new DualSideExecutor();
+
+const runner = new StrategyRunner({
+  initialStake: config.baseStake || 1,
+  growthRate: config.growthRate || 0.10,
+  riskPercent: config.riskPercent || 2.5,
+  profitTargetPercent: config.profitTargetPercent || 20,
+  lossLimitPercent: config.lossLimitPercent || 10,
+  maxDrawdownPercent: config.maxDrawdownPercent || 12,
+  hedgeMode: false,
+  autoExecuteFavoredSide: true,
+  stopLossPercent: config.stopLossPercent || 1.5,
+  takeProfitPercent: config.takeProfitPercent || 2.5,
+  payoutMultiplier: config.payoutMultiplier || 1.8
+});
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -33,11 +46,11 @@ app.get('/api/balance', (req, res) => {
 app.post('/api/plan', (req, res) => {
   try {
     const {
-      stake = config.baseStake,
-      profitTargetPercent = config.profitTargetPercent,
-      lossLimitPercent = config.lossLimitPercent,
-      riskPercent = config.riskPercent,
-      growthRate = config.growthRate,
+      stake = config.baseStake || 1,
+      profitTargetPercent = config.profitTargetPercent || 20,
+      lossLimitPercent = config.lossLimitPercent || 10,
+      riskPercent = config.riskPercent || 2.5,
+      growthRate = config.growthRate || 0.10,
       entryPrice = 1.1000,
       cycle = 1
     } = req.body;
@@ -67,13 +80,13 @@ app.post('/api/plan', (req, res) => {
       stake: tradeStake,
       cycle,
       entryPrice,
-      stopLossPercent: config.stopLossPercent,
-      takeProfitPercent: config.takeProfitPercent,
-      payoutMultiplier: config.payoutMultiplier,
+      stopLossPercent: config.stopLossPercent || 1.5,
+      takeProfitPercent: config.takeProfitPercent || 2.5,
+      payoutMultiplier: config.payoutMultiplier || 1.8,
       riskPerTrade,
       profitTarget,
       lossLimit,
-      maxDrawdownPercent: config.maxDrawdownPercent,
+      maxDrawdownPercent: config.maxDrawdownPercent || 12,
       growthRate
     });
 
@@ -83,30 +96,18 @@ app.post('/api/plan', (req, res) => {
   }
 });
 
-app.post('/api/dual-side', (req, res) => {
+app.post('/api/decision', (req, res) => {
   try {
     const {
-      stake = config.baseStake,
-      profitTargetPercent = config.profitTargetPercent,
-      lossLimitPercent = config.lossLimitPercent,
-      riskPercent = config.riskPercent,
-      growthRate = config.growthRate,
+      cycle = 1,
       currentPrice = 1.1000,
-      cycle = 1
+      accountBalance: inputBalance = accountBalance
     } = req.body;
 
-    dualExecutor = new DualSideExecutor();
-
-    const result = dualExecutor.generateDualPlans(cycle, currentPrice, accountBalance, {
-      stake,
-      profitTargetPercent,
-      lossLimitPercent,
-      riskPercent,
-      growthRate,
-      stopLossPercent: config.stopLossPercent,
-      takeProfitPercent: config.takeProfitPercent,
-      payoutMultiplier: config.payoutMultiplier,
-      maxDrawdownPercent: config.maxDrawdownPercent
+    const result = runner.buildDecision({
+      cycle,
+      currentPrice,
+      accountBalance: inputBalance
     });
 
     res.json(result);
@@ -115,21 +116,32 @@ app.post('/api/dual-side', (req, res) => {
   }
 });
 
-app.post('/api/execute-favored-side', (req, res) => {
+app.post('/api/dual-side', (req, res) => {
   try {
-    if (!dualExecutor.selectedSide) {
-      return res.status(400).json({ error: 'No favored side. Run /api/dual-side first.' });
-    }
+    const {
+      cycle = 1,
+      currentPrice = 1.1000,
+      accountBalance: inputBalance = accountBalance,
+      stake = config.baseStake || 1,
+      profitTargetPercent = config.profitTargetPercent || 20,
+      lossLimitPercent = config.lossLimitPercent || 10,
+      riskPercent = config.riskPercent || 2.5,
+      growthRate = config.growthRate || 0.10
+    } = req.body;
 
-    const trade = dualExecutor.executeRecommendedSide();
-    tradeHistory.push({
-      ...trade,
-      symbol: 'EURUSD',
-      status: 'favored-side-open',
-      timestamp: new Date()
+    runner.config.initialStake = stake;
+    runner.config.profitTargetPercent = profitTargetPercent;
+    runner.config.lossLimitPercent = lossLimitPercent;
+    runner.config.riskPercent = riskPercent;
+    runner.config.growthRate = growthRate;
+
+    const result = runner.buildDecision({
+      cycle,
+      currentPrice,
+      accountBalance: inputBalance
     });
 
-    res.json(trade);
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -138,7 +150,7 @@ app.post('/api/execute-favored-side', (req, res) => {
 app.post('/api/execute', (req, res) => {
   try {
     if (!currentPlan) {
-      return res.status(400).json({ error: 'No plan created' });
+      return res.status(400).json({ error: 'No plan created. Call /api/plan first.' });
     }
 
     const trade = {
@@ -150,12 +162,72 @@ app.post('/api/execute', (req, res) => {
       risk: currentPlan.risk,
       reward: currentPlan.reward,
       riskReward: currentPlan.riskReward,
-      timestamp: new Date(),
+      timestamp: new Date().toISOString(),
       status: 'open'
     };
 
     tradeHistory.push(trade);
     res.json(trade);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/execute-favored-side', (req, res) => {
+  try {
+    const {
+      cycle = 1,
+      currentPrice = 1.1000,
+      accountBalance: inputBalance = accountBalance
+    } = req.body;
+
+    const execution = runner.executeDecision({
+      cycle,
+      currentPrice,
+      accountBalance: inputBalance
+    });
+
+    const tradeRecord = {
+      ...execution.trade,
+      symbol: 'EURUSD',
+      status: 'executed',
+      timestamp: new Date().toISOString(),
+      type: 'FAVORED_SIDE'
+    };
+
+    tradeHistory.push(tradeRecord);
+    res.json({ ...execution, tradeRecord });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/execute-hedge', (req, res) => {
+  try {
+    runner.config.hedgeMode = true;
+
+    const {
+      cycle = 1,
+      currentPrice = 1.1000,
+      accountBalance: inputBalance = accountBalance
+    } = req.body;
+
+    const execution = runner.executeDecision({
+      cycle,
+      currentPrice,
+      accountBalance: inputBalance
+    });
+
+    const tradeRecord = {
+      ...execution.trade,
+      symbol: 'EURUSD',
+      status: 'executed',
+      timestamp: new Date().toISOString(),
+      type: 'HEDGE'
+    };
+
+    tradeHistory.push(tradeRecord);
+    res.json({ ...execution, tradeRecord });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -170,9 +242,9 @@ app.get('/api/config', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 Primacy Dashboard running at http://localhost:${PORT}`);
-  console.log(`📊 Open your browser and navigate to http://localhost:${PORT}`);
-  console.log(`🎯 Dual Side Executor: ENABLED\n`);
+  console.log(`\n🚀 Primacy dashboard running at http://localhost:${PORT}`);
+  console.log(`📊 Open: http://localhost:${PORT}`);
+  console.log(`🎯 Dual-side analysis + favored-side execution enabled\n`);
 });
 
 module.exports = app;
