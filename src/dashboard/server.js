@@ -9,6 +9,7 @@ const config = require('../../config/primacy.config');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DERIV_MODE = process.env.DERIV_MODE || 'demo';
+const DEFAULT_SYMBOLS = ['R_100', 'R_50', 'EURUSD', 'GBPUSD', 'AUDUSD', 'USDJPY'];
 const journal = new TradeJournal();
 
 let tradeHistory = [];
@@ -16,7 +17,7 @@ let accountBalance = 1000;
 let currentPlan = null;
 let derivClient = null;
 
-const getRunner = (presetName = 'balanced') => {
+const getRunner = (presetName = 'balanced', symbol = process.env.DERIV_SYMBOL || config.market || 'R_100') => {
   const preset = getPreset(presetName) || getPreset('balanced');
   return new StrategyRunner({
     initialStake: preset.baseStake || config.baseStake || 1,
@@ -29,11 +30,34 @@ const getRunner = (presetName = 'balanced') => {
     autoExecuteFavoredSide: true,
     stopLossPercent: preset.stopLossPercent || config.stopLossPercent || 1.5,
     takeProfitPercent: preset.takeProfitPercent || config.takeProfitPercent || 2.5,
-    payoutMultiplier: config.payoutMultiplier || 1.8
+    payoutMultiplier: config.payoutMultiplier || 1.8,
+    symbol
   });
 };
 
 let runner = getRunner();
+
+const buildRiskSummary = (plan, balance = accountBalance) => {
+  if (!plan) {
+    return {
+      safe: true,
+      status: 'no_plan',
+      riskPerTrade: 0,
+      maxDrawdown: 0,
+      lossLimit: 0,
+      accountBalance: Number(balance || 0)
+    };
+  }
+
+  return {
+    safe: plan.safe !== false,
+    status: plan.safe === false ? 'risk_limit_exceeded' : 'within_limits',
+    riskPerTrade: Number(plan.riskPerTrade || 0),
+    maxDrawdown: Number(plan.maxDrawdown || 0),
+    lossLimit: Number(plan.lossLimit || 0),
+    accountBalance: Number(balance || 0)
+  };
+};
 
 const recordTrade = (trade) => {
   const entry = journal.addTrade({
@@ -51,8 +75,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.post('/api/connect', async (req, res) => {
   try {
-    const { mode = DERIV_MODE, preset = 'balanced' } = req.body;
-    runner = getRunner(preset);
+    const { mode = DERIV_MODE, preset = 'balanced', symbol = process.env.DERIV_SYMBOL || config.market || 'R_100' } = req.body;
+    runner = getRunner(preset, symbol);
 
     if (mode === 'live') {
       if (!process.env.DERIV_TOKEN) {
@@ -64,7 +88,7 @@ app.post('/api/connect', async (req, res) => {
       derivClient = new DerivClient({
         appId: process.env.DERIV_APP_ID || 31019,
         token: process.env.DERIV_TOKEN,
-        symbol: process.env.DERIV_SYMBOL || 'R_100',
+        symbol,
         currency: process.env.DERIV_CURRENCY || 'USD',
         payoutMultiplier: config.payoutMultiplier,
         mode: 'live'
@@ -80,11 +104,12 @@ app.post('/api/connect', async (req, res) => {
         balance: accountBalance,
         currency: accountInfo.currency,
         email: accountInfo.email,
-        preset
+        preset,
+        symbol
       });
     }
 
-    return res.json({ status: 'connected', mode: 'demo', balance: accountBalance, preset });
+    return res.json({ status: 'connected', mode: 'demo', balance: accountBalance, preset, symbol });
   } catch (error) {
     console.error('[Server] Connection error:', error.message);
     res.status(500).json({ error: error.message });
@@ -99,9 +124,28 @@ app.get('/api/presets', (req, res) => {
   res.json({ presets: getPresets() });
 });
 
+app.get('/api/symbols', (req, res) => {
+  res.json({ symbols: DEFAULT_SYMBOLS, active: process.env.DERIV_SYMBOL || config.market || 'R_100' });
+});
+
 app.get('/api/session-summary', (req, res) => {
   const summary = journal.getSessionSummary({ startBalance: 1000, currentBalance: accountBalance });
   res.json(summary);
+});
+
+app.get('/api/analytics', (req, res) => {
+  const trades = journal.getTrades();
+  const summary = journal.getSessionSummary({ startBalance: 1000, currentBalance: accountBalance });
+  const risk = buildRiskSummary(currentPlan, accountBalance);
+
+  res.json({
+    trades,
+    count: trades.length,
+    summary,
+    risk,
+    preset: runner.config,
+    mode: derivClient ? 'live' : 'demo'
+  });
 });
 
 app.get('/api/trades/export', (req, res) => {
@@ -112,7 +156,6 @@ app.get('/api/trades/export', (req, res) => {
 
 app.post('/api/plan', (req, res) => {
   try {
-    const { StrategyRunner: SR } = require('../lib/strategyRunner');
     const { buildExecutionPlan } = require('../lib/executionCalculator');
     const { calculateStake, calculateProfitTarget, calculateLossLimit, calculateRiskPerTrade } =
       require('../lib/riskManager');
@@ -125,7 +168,8 @@ app.post('/api/plan', (req, res) => {
       growthRate = config.growthRate || 0.1,
       entryPrice = 1.1,
       cycle = 1,
-      preset = 'balanced'
+      preset = 'balanced',
+      symbol = process.env.DERIV_SYMBOL || config.market || 'R_100'
     } = req.body;
 
     const selectedPreset = getPreset(preset) || getPreset('balanced');
@@ -151,7 +195,10 @@ app.post('/api/plan', (req, res) => {
       growthRate: activeGrowth
     });
 
-    res.json({ ...currentPlan, preset: selectedPreset.name || preset });
+    currentPlan.riskSummary = buildRiskSummary(currentPlan, accountBalance);
+    currentPlan.symbol = symbol;
+    currentPlan.preset = preset;
+    res.json({ ...currentPlan, preset: selectedPreset.name || preset, symbol });
   } catch (error) {
     console.error('[Server] Plan error:', error.message);
     res.status(500).json({ error: error.message });
@@ -161,7 +208,7 @@ app.post('/api/plan', (req, res) => {
 app.post('/api/decision', (req, res) => {
   try {
     const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance, preset = 'balanced' } = req.body;
-    runner = getRunner(preset);
+    runner = getRunner(preset, process.env.DERIV_SYMBOL || config.market || 'R_100');
 
     const result = runner.buildDecision({
       cycle,
@@ -187,11 +234,12 @@ app.post('/api/dual-side', (req, res) => {
       lossLimitPercent = config.lossLimitPercent || 10,
       riskPercent = config.riskPercent || 2.5,
       growthRate = config.growthRate || 0.1,
-      preset = 'balanced'
+      preset = 'balanced',
+      symbol = process.env.DERIV_SYMBOL || config.market || 'R_100'
     } = req.body;
 
     const selectedPreset = getPreset(preset) || getPreset('balanced');
-    runner = getRunner(preset);
+    runner = getRunner(preset, symbol);
     runner.config.initialStake = stake || selectedPreset.baseStake || config.baseStake || 1;
     runner.config.profitTargetPercent = profitTargetPercent || selectedPreset.profitTargetPercent || config.profitTargetPercent || 20;
     runner.config.lossLimitPercent = lossLimitPercent || selectedPreset.lossLimitPercent || config.lossLimitPercent || 10;
@@ -213,10 +261,17 @@ app.post('/api/execute-favored-side', async (req, res) => {
     }
 
     const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance, preset = 'balanced' } = req.body;
-    runner = getRunner(preset);
+    runner = getRunner(preset, process.env.DERIV_SYMBOL || config.market || 'R_100');
 
     const analysis = runner.buildDecision({ cycle, currentPrice, accountBalance: inputBalance });
     const side = analysis.favoredSide;
+
+    if (analysis.riskGuard && analysis.riskGuard.safe === false) {
+      return res.status(400).json({
+        error: 'Risk limit exceeded. Reduce stake or adjust your preset before executing.',
+        risk: analysis.riskGuard
+      });
+    }
 
     if (derivClient && derivClient.connected) {
       const tradeResult = await derivClient.executeTrade(currentPlan, side);
@@ -232,7 +287,7 @@ app.post('/api/execute-favored-side', async (req, res) => {
     }
 
     const simulatedTrade = {
-      symbol: 'EURUSD',
+      symbol: currentPlan.symbol || 'EURUSD',
       side,
       stake: currentPlan.stake,
       entryPrice: currentPlan.entryPrice,
@@ -256,13 +311,13 @@ app.post('/api/execute-favored-side', async (req, res) => {
 app.post('/api/execute-hedge', async (req, res) => {
   try {
     const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance, preset = 'balanced' } = req.body;
-    runner = getRunner(preset);
+    runner = getRunner(preset, process.env.DERIV_SYMBOL || config.market || 'R_100');
     runner.config.hedgeMode = true;
 
     const analysis = runner.buildDecision({ cycle, currentPrice, accountBalance: inputBalance });
 
     const upTrade = currentPlan ? {
-      symbol: 'EURUSD',
+      symbol: currentPlan.symbol || 'EURUSD',
       side: 'UP',
       stake: Number((currentPlan.stake * 0.5).toFixed(4)),
       entryPrice: currentPlan.entryPrice,
@@ -275,7 +330,7 @@ app.post('/api/execute-hedge', async (req, res) => {
     } : null;
 
     const downTrade = currentPlan ? {
-      symbol: 'EURUSD',
+      symbol: currentPlan.symbol || 'EURUSD',
       side: 'DOWN',
       stake: Number((currentPlan.stake * 0.5).toFixed(4)),
       entryPrice: currentPlan.entryPrice,
@@ -290,15 +345,12 @@ app.post('/api/execute-hedge', async (req, res) => {
     if (derivClient && derivClient.connected && upTrade && downTrade) {
       const upResult = await derivClient.executeTrade(upTrade, 'UP');
       const downResult = await derivClient.executeTrade(downTrade, 'DOWN');
-
       const a = recordTrade({ ...upResult, pnl: Number((upResult.profit || 0).toFixed(4)), status: 'executed', mode: 'live' });
       const b = recordTrade({ ...downResult, pnl: Number((downResult.profit || 0).toFixed(4)), status: 'executed', mode: 'live' });
-
       return res.json({ trades: [a, b], analysis, mode: 'live', status: 'executed', strategy: 'hedge' });
     }
 
     const simulatedTrades = [upTrade, downTrade].filter(Boolean).map((t) => recordTrade(t));
-
     return res.json({ trades: simulatedTrades, analysis, mode: 'demo', status: 'simulated', strategy: 'hedge' });
   } catch (error) {
     console.error('[Server] Hedge error:', error.message);
@@ -307,9 +359,10 @@ app.post('/api/execute-hedge', async (req, res) => {
 });
 
 app.get('/api/trades', (req, res) => {
+  const trades = journal.getTrades();
   res.json({
-    trades: tradeHistory,
-    count: tradeHistory.length,
+    trades,
+    count: trades.length,
     mode: derivClient ? 'live' : 'demo'
   });
 });
@@ -319,7 +372,8 @@ app.get('/api/config', (req, res) => {
     ...config,
     mode: derivClient ? 'live' : 'demo',
     connected: derivClient ? derivClient.connected : false,
-    presets: getPresets()
+    presets: getPresets(),
+    symbols: DEFAULT_SYMBOLS
   });
 });
 
