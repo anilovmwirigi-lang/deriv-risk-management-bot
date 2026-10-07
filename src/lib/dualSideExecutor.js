@@ -14,10 +14,6 @@ class DualSideExecutor {
     this.selectedSide = null;
   }
 
-  /**
-   * Generate both UP and DOWN execution plans.
-   * Returns the one with the better risk/reward ratio.
-   */
   generateDualPlans(cycle, currentPrice, accountBalance, config = {}) {
     const {
       stake = 1,
@@ -31,28 +27,11 @@ class DualSideExecutor {
       maxDrawdownPercent = 12
     } = config;
 
-    const tradeStake = calculateStake({
-      baseStake: stake,
-      growthRate,
-      cycle
-    });
+    const tradeStake = calculateStake({ baseStake: stake, growthRate, cycle });
+    const riskPerTrade = calculateRiskPerTrade({ accountBalance, riskPercent });
+    const profitTarget = calculateProfitTarget({ stake: tradeStake, pct: profitTargetPercent });
+    const lossLimit = calculateLossLimit({ stake: tradeStake, pct: lossLimitPercent });
 
-    const riskPerTrade = calculateRiskPerTrade({
-      accountBalance,
-      riskPercent
-    });
-
-    const profitTarget = calculateProfitTarget({
-      stake: tradeStake,
-      pct: profitTargetPercent
-    });
-
-    const lossLimit = calculateLossLimit({
-      stake: tradeStake,
-      pct: lossLimitPercent
-    });
-
-    // UP SIDE (CALL) - Price expected to go UP
     const upSideEntry = currentPrice;
     const upSideStopLoss = Number((upSideEntry * (1 - stopLossPercent / 100)).toFixed(4));
     const upSideTakeProfit = Number((upSideEntry * (1 + takeProfitPercent / 100)).toFixed(4));
@@ -77,7 +56,6 @@ class DualSideExecutor {
     this.upSidePlan.stopLossPrice = upSideStopLoss;
     this.upSidePlan.takeProfitPrice = upSideTakeProfit;
 
-    // DOWN SIDE (PUT) - Price expected to go DOWN
     const downSideEntry = currentPrice;
     const downSideStopLoss = Number((downSideEntry * (1 + stopLossPercent / 100)).toFixed(4));
     const downSideTakeProfit = Number((downSideEntry * (1 - takeProfitPercent / 100)).toFixed(4));
@@ -105,9 +83,6 @@ class DualSideExecutor {
     return this.comparePlans();
   }
 
-  /**
-   * Compare both sides and favor the better one.
-   */
   comparePlans() {
     if (!this.upSidePlan || !this.downSidePlan) {
       throw new Error('Both plans must be generated first');
@@ -117,14 +92,8 @@ class DualSideExecutor {
     const downSideScore = this.calculatePlanScore(this.downSidePlan);
 
     const comparison = {
-      upSide: {
-        ...this.upSidePlan,
-        score: upSideScore
-      },
-      downSide: {
-        ...this.downSidePlan,
-        score: downSideScore
-      },
+      upSide: { ...this.upSidePlan, score: upSideScore },
+      downSide: { ...this.downSidePlan, score: downSideScore },
       recommendation: upSideScore > downSideScore ? 'UP' : 'DOWN',
       scoreGap: Math.abs(upSideScore - downSideScore).toFixed(3),
       rationale: this.generateRationale(upSideScore, downSideScore)
@@ -134,10 +103,6 @@ class DualSideExecutor {
     return comparison;
   }
 
-  /**
-   * Calculate quality score for a plan.
-   * Higher is better.
-   */
   calculatePlanScore(plan) {
     const riskRewardWeight = 0.4;
     const safetyWeight = 0.3;
@@ -147,28 +112,20 @@ class DualSideExecutor {
     const safetyScore = plan.safe ? 100 : 50;
     const profitScore = (plan.profitTarget / plan.lossLimit) * 20;
 
-    const totalScore =
+    return (
       riskRewardScore * riskRewardWeight +
       safetyScore * safetyWeight +
-      Math.min(profitScore, 100) * profitWeight;
-
-    return totalScore;
+      Math.min(profitScore, 100) * profitWeight
+    );
   }
 
-  /**
-   * Generate explanation for recommendation.
-   */
   generateRationale(upScore, downScore) {
     const difference = Math.abs(upScore - downScore);
     const favored = upScore > downScore ? 'UP' : 'DOWN';
     const strength = difference > 20 ? 'STRONG' : difference > 10 ? 'MODERATE' : 'WEAK';
-
     return `${strength} signal favoring ${favored} side (Score gap: ${difference.toFixed(2)} points)`;
   }
 
-  /**
-   * Execute the recommended side.
-   */
   executeRecommendedSide() {
     if (!this.selectedSide) {
       throw new Error('No recommendation available. Run comparePlans first.');
@@ -184,9 +141,6 @@ class DualSideExecutor {
     };
   }
 
-  /**
-   * Execute both sides simultaneously (hedging).
-   */
   executeBothSides(stakeAdjustment = 0.5) {
     return {
       strategy: 'Dual Side Hedge',
@@ -208,9 +162,6 @@ class DualSideExecutor {
     };
   }
 
-  /**
-   * Get summary of both plans.
-   */
   getSummary() {
     return {
       upSide: {
