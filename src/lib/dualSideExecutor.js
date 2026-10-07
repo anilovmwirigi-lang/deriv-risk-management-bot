@@ -1,1 +1,242 @@
-const { buildExecutionPlan } = require('../lib/executionCalculator');\nconst { calculateStake, calculateProfitTarget, calculateLossLimit, calculateRiskPerTrade } = require('../lib/riskManager');\n\nclass DualSideExecutor {\n  constructor() {\n    this.name = 'Dual Side Executor';\n    this.upSidePlan = null;\n    this.downSidePlan = null;\n    this.selectedSide = null;\n  }\n\n  /**\n   * Generate both UP and DOWN execution plans\n   * Returns the one with better risk/reward ratio\n   */\n  generateDualPlans(cycle, currentPrice, accountBalance, config = {}) {\n    const {\n      stake = 1,\n      profitTargetPercent = 20,\n      lossLimitPercent = 10,\n      riskPercent = 2.5,\n      growthRate = 0.10,\n      stopLossPercent = 1.5,\n      takeProfitPercent = 2.5,\n      payoutMultiplier = 1.8,\n      maxDrawdownPercent = 12\n    } = config;\n\n    const tradeStake = calculateStake({\n      baseStake: stake,\n      growthRate,\n      cycle\n    });\n\n    const riskPerTrade = calculateRiskPerTrade({\n      accountBalance,\n      riskPercent\n    });\n\n    const profitTarget = calculateProfitTarget({\n      stake: tradeStake,\n      pct: profitTargetPercent\n    });\n\n    const lossLimit = calculateLossLimit({\n      stake: tradeStake,\n      pct: lossLimitPercent\n    });\n\n    // UP SIDE (CALL) - Price expected to go UP\n    const upSideEntry = currentPrice;\n    const upSideStopLoss = Number((upSideEntry * (1 - stopLossPercent / 100)).toFixed(4));\n    const upSideTakeProfit = Number((upSideEntry * (1 + takeProfitPercent / 100)).toFixed(4));\n\n    this.upSidePlan = buildExecutionPlan({\n      stake: tradeStake,\n      cycle,\n      entryPrice: upSideEntry,\n      stopLossPercent,\n      takeProfitPercent,\n      payoutMultiplier,\n      riskPerTrade,\n      profitTarget,\n      lossLimit,\n      maxDrawdownPercent,\n      growthRate\n    });\n\n    this.upSidePlan.direction = 'UP';\n    this.upSidePlan.type = 'CALL';\n    this.upSidePlan.signal = 'Price expected to rise';\n\n    // DOWN SIDE (PUT) - Price expected to go DOWN\n    const downSideEntry = currentPrice;\n    const downSideStopLoss = Number((downSideEntry * (1 + stopLossPercent / 100)).toFixed(4));\n    const downSideTakeProfit = Number((downSideEntry * (1 - takeProfitPercent / 100)).toFixed(4));\n\n    this.downSidePlan = buildExecutionPlan({\n      stake: tradeStake,\n      cycle,\n      entryPrice: downSideEntry,\n      stopLossPercent,\n      takeProfitPercent,\n      payoutMultiplier,\n      riskPerTrade,\n      profitTarget,\n      lossLimit,\n      maxDrawdownPercent,\n      growthRate\n    });\n\n    // Adjust for DOWN side\n    this.downSidePlan.stopLossPrice = downSideStopLoss;\n    this.downSidePlan.takeProfitPrice = downSideTakeProfit;\n    this.downSidePlan.direction = 'DOWN';\n    this.downSidePlan.type = 'PUT';\n    this.downSidePlan.signal = 'Price expected to fall';\n\n    return this.comparePlans();\n  }\n\n  /**\n   * Compare both sides and favor the better one\n   */\n  comparePlans() {\n    if (!this.upSidePlan || !this.downSidePlan) {\n      throw new Error('Both plans must be generated first');\n    }\n\n    const upSideScore = this.calculatePlanScore(this.upSidePlan);\n    const downSideScore = this.calculatePlanScore(this.downSidePlan);\n\n    const comparison = {\n      upSide: {\n        ...this.upSidePlan,\n        score: upSideScore\n      },\n      downSide: {\n        ...this.downSidePlan,\n        score: downSideScore\n      },\n      recommendation: upSideScore > downSideScore ? 'UP' : 'DOWN',\n      scoreGap: Math.abs(upSideScore - downSideScore).toFixed(3),\n      rationale: this.generateRationale(upSideScore, downSideScore)\n    };\n\n    this.selectedSide = comparison.recommendation;\n    return comparison;\n  }\n\n  /**\n   * Calculate quality score for a plan\n   * Higher is better\n   */\n  calculatePlanScore(plan) {\n    const riskRewardWeight = 0.4;\n    const safetyWeight = 0.3;\n    const profitWeight = 0.3;\n\n    const riskRewardScore = Math.min(plan.riskReward * 10, 100); // Normalize to 0-100\n    const safetyScore = plan.safe ? 100 : 50;\n    const profitScore = (plan.profitTarget / plan.lossLimit) * 20; // Profit to loss ratio\n\n    const totalScore =\n      riskRewardScore * riskRewardWeight +\n      safetyScore * safetyWeight +\n      Math.min(profitScore, 100) * profitWeight;\n\n    return totalScore;\n  }\n\n  /**\n   * Generate explanation for recommendation\n   */\n  generateRationale(upScore, downScore) {\n    const difference = Math.abs(upScore - downScore);\n    const favored = upScore > downScore ? 'UP' : 'DOWN';\n    const strength = difference > 20 ? 'STRONG' : difference > 10 ? 'MODERATE' : 'WEAK';\n\n    return `${strength} signal favoring ${favored} side (Score gap: ${difference.toFixed(2)} points)`;\n  }\n\n  /**\n   * Execute the recommended side\n   */\n  executeRecommendedSide() {\n    if (!this.selectedSide) {\n      throw new Error('No recommendation available. Run comparePlans first.');\n    }\n\n    const selectedPlan =\n      this.selectedSide === 'UP' ? this.upSidePlan : this.downSidePlan;\n\n    return {\n      ...selectedPlan,\n      executedAt: new Date(),\n      reason: `Auto-selected ${this.selectedSide} side based on risk/reward analysis`,\n      symbol: 'EURUSD'\n    };\n  }\n\n  /**\n   * Execute both sides simultaneously (hedging)\n   */\n  executeBothSides(stakeAdjustment = 0.5) {\n    return {\n      strategy: 'Dual Side Hedge',\n      upSideTrade: {\n        ...this.upSidePlan,\n        stake: (this.upSidePlan.stake * stakeAdjustment).toFixed(4),\n        status: 'open',\n        executedAt: new Date()\n      },\n      downSideTrade: {\n        ...this.downSidePlan,\n        stake: (this.downSidePlan.stake * stakeAdjustment).toFixed(4),\n        status: 'open',\n        executedAt: new Date()\n      },\n      totalStake: (this.upSidePlan.stake + this.downSidePlan.stake).toFixed(4),\n      hedgeRatio: stakeAdjustment,\n      description: 'Both sides open simultaneously for market neutral strategy'\n    };\n  }\n\n  /**\n   * Get summary of both plans\n   */\n  getSummary() {\n    return {\n      upSide: {\n        direction: this.upSidePlan.direction,\n        type: this.upSidePlan.type,\n        entryPrice: this.upSidePlan.entryPrice,\n        stopLossPrice: this.upSidePlan.stopLossPrice,\n        takeProfitPrice: this.upSidePlan.takeProfitPrice,\n        riskReward: this.upSidePlan.riskReward.toFixed(2) + 'x',\n        signal: this.upSidePlan.signal,\n        stake: this.upSidePlan.stake.toFixed(4)\n      },\n      downSide: {\n        direction: this.downSidePlan.direction,\n        type: this.downSidePlan.type,\n        entryPrice: this.downSidePlan.entryPrice,\n        stopLossPrice: this.downSidePlan.stopLossPrice,\n        takeProfitPrice: this.downSidePlan.takeProfitPrice,\n        riskReward: this.downSidePlan.riskReward.toFixed(2) + 'x',\n        signal: this.downSidePlan.signal,\n        stake: this.downSidePlan.stake.toFixed(4)\n      },\n      recommendation: this.selectedSide,\n      timestamp: new Date()\n    };\n  }\n}\n\nmodule.exports = { DualSideExecutor };\n
+const { buildExecutionPlan } = require('./executionCalculator');
+const {
+  calculateStake,
+  calculateProfitTarget,
+  calculateLossLimit,
+  calculateRiskPerTrade
+} = require('./riskManager');
+
+class DualSideExecutor {
+  constructor() {
+    this.name = 'Dual Side Executor';
+    this.upSidePlan = null;
+    this.downSidePlan = null;
+    this.selectedSide = null;
+  }
+
+  /**
+   * Generate both UP and DOWN execution plans.
+   * Returns the one with the better risk/reward ratio.
+   */
+  generateDualPlans(cycle, currentPrice, accountBalance, config = {}) {
+    const {
+      stake = 1,
+      profitTargetPercent = 20,
+      lossLimitPercent = 10,
+      riskPercent = 2.5,
+      growthRate = 0.1,
+      stopLossPercent = 1.5,
+      takeProfitPercent = 2.5,
+      payoutMultiplier = 1.8,
+      maxDrawdownPercent = 12
+    } = config;
+
+    const tradeStake = calculateStake({
+      baseStake: stake,
+      growthRate,
+      cycle
+    });
+
+    const riskPerTrade = calculateRiskPerTrade({
+      accountBalance,
+      riskPercent
+    });
+
+    const profitTarget = calculateProfitTarget({
+      stake: tradeStake,
+      pct: profitTargetPercent
+    });
+
+    const lossLimit = calculateLossLimit({
+      stake: tradeStake,
+      pct: lossLimitPercent
+    });
+
+    // UP SIDE (CALL) - Price expected to go UP
+    const upSideEntry = currentPrice;
+    const upSideStopLoss = Number((upSideEntry * (1 - stopLossPercent / 100)).toFixed(4));
+    const upSideTakeProfit = Number((upSideEntry * (1 + takeProfitPercent / 100)).toFixed(4));
+
+    this.upSidePlan = buildExecutionPlan({
+      stake: tradeStake,
+      cycle,
+      entryPrice: upSideEntry,
+      stopLossPercent,
+      takeProfitPercent,
+      payoutMultiplier,
+      riskPerTrade,
+      profitTarget,
+      lossLimit,
+      maxDrawdownPercent,
+      growthRate
+    });
+
+    this.upSidePlan.direction = 'UP';
+    this.upSidePlan.type = 'CALL';
+    this.upSidePlan.signal = 'Price expected to rise';
+    this.upSidePlan.stopLossPrice = upSideStopLoss;
+    this.upSidePlan.takeProfitPrice = upSideTakeProfit;
+
+    // DOWN SIDE (PUT) - Price expected to go DOWN
+    const downSideEntry = currentPrice;
+    const downSideStopLoss = Number((downSideEntry * (1 + stopLossPercent / 100)).toFixed(4));
+    const downSideTakeProfit = Number((downSideEntry * (1 - takeProfitPercent / 100)).toFixed(4));
+
+    this.downSidePlan = buildExecutionPlan({
+      stake: tradeStake,
+      cycle,
+      entryPrice: downSideEntry,
+      stopLossPercent,
+      takeProfitPercent,
+      payoutMultiplier,
+      riskPerTrade,
+      profitTarget,
+      lossLimit,
+      maxDrawdownPercent,
+      growthRate
+    });
+
+    this.downSidePlan.stopLossPrice = downSideStopLoss;
+    this.downSidePlan.takeProfitPrice = downSideTakeProfit;
+    this.downSidePlan.direction = 'DOWN';
+    this.downSidePlan.type = 'PUT';
+    this.downSidePlan.signal = 'Price expected to fall';
+
+    return this.comparePlans();
+  }
+
+  /**
+   * Compare both sides and favor the better one.
+   */
+  comparePlans() {
+    if (!this.upSidePlan || !this.downSidePlan) {
+      throw new Error('Both plans must be generated first');
+    }
+
+    const upSideScore = this.calculatePlanScore(this.upSidePlan);
+    const downSideScore = this.calculatePlanScore(this.downSidePlan);
+
+    const comparison = {
+      upSide: {
+        ...this.upSidePlan,
+        score: upSideScore
+      },
+      downSide: {
+        ...this.downSidePlan,
+        score: downSideScore
+      },
+      recommendation: upSideScore > downSideScore ? 'UP' : 'DOWN',
+      scoreGap: Math.abs(upSideScore - downSideScore).toFixed(3),
+      rationale: this.generateRationale(upSideScore, downSideScore)
+    };
+
+    this.selectedSide = comparison.recommendation;
+    return comparison;
+  }
+
+  /**
+   * Calculate quality score for a plan.
+   * Higher is better.
+   */
+  calculatePlanScore(plan) {
+    const riskRewardWeight = 0.4;
+    const safetyWeight = 0.3;
+    const profitWeight = 0.3;
+
+    const riskRewardScore = Math.min(plan.riskReward * 10, 100);
+    const safetyScore = plan.safe ? 100 : 50;
+    const profitScore = (plan.profitTarget / plan.lossLimit) * 20;
+
+    const totalScore =
+      riskRewardScore * riskRewardWeight +
+      safetyScore * safetyWeight +
+      Math.min(profitScore, 100) * profitWeight;
+
+    return totalScore;
+  }
+
+  /**
+   * Generate explanation for recommendation.
+   */
+  generateRationale(upScore, downScore) {
+    const difference = Math.abs(upScore - downScore);
+    const favored = upScore > downScore ? 'UP' : 'DOWN';
+    const strength = difference > 20 ? 'STRONG' : difference > 10 ? 'MODERATE' : 'WEAK';
+
+    return `${strength} signal favoring ${favored} side (Score gap: ${difference.toFixed(2)} points)`;
+  }
+
+  /**
+   * Execute the recommended side.
+   */
+  executeRecommendedSide() {
+    if (!this.selectedSide) {
+      throw new Error('No recommendation available. Run comparePlans first.');
+    }
+
+    const selectedPlan = this.selectedSide === 'UP' ? this.upSidePlan : this.downSidePlan;
+
+    return {
+      ...selectedPlan,
+      executedAt: new Date(),
+      reason: `Auto-selected ${this.selectedSide} side based on risk/reward analysis`,
+      symbol: 'EURUSD'
+    };
+  }
+
+  /**
+   * Execute both sides simultaneously (hedging).
+   */
+  executeBothSides(stakeAdjustment = 0.5) {
+    return {
+      strategy: 'Dual Side Hedge',
+      upSideTrade: {
+        ...this.upSidePlan,
+        stake: (this.upSidePlan.stake * stakeAdjustment).toFixed(4),
+        status: 'open',
+        executedAt: new Date()
+      },
+      downSideTrade: {
+        ...this.downSidePlan,
+        stake: (this.downSidePlan.stake * stakeAdjustment).toFixed(4),
+        status: 'open',
+        executedAt: new Date()
+      },
+      totalStake: (this.upSidePlan.stake + this.downSidePlan.stake).toFixed(4),
+      hedgeRatio: stakeAdjustment,
+      description: 'Both sides open simultaneously for market neutral strategy'
+    };
+  }
+
+  /**
+   * Get summary of both plans.
+   */
+  getSummary() {
+    return {
+      upSide: {
+        direction: this.upSidePlan.direction,
+        type: this.upSidePlan.type,
+        entryPrice: this.upSidePlan.entryPrice,
+        stopLossPrice: this.upSidePlan.stopLossPrice,
+        takeProfitPrice: this.upSidePlan.takeProfitPrice,
+        riskReward: `${this.upSidePlan.riskReward.toFixed(2)}x`,
+        signal: this.upSidePlan.signal,
+        stake: this.upSidePlan.stake.toFixed(4)
+      },
+      downSide: {
+        direction: this.downSidePlan.direction,
+        type: this.downSidePlan.type,
+        entryPrice: this.downSidePlan.entryPrice,
+        stopLossPrice: this.downSidePlan.stopLossPrice,
+        takeProfitPrice: this.downSidePlan.takeProfitPrice,
+        riskReward: `${this.downSidePlan.riskReward.toFixed(2)}x`,
+        signal: this.downSidePlan.signal,
+        stake: this.downSidePlan.stake.toFixed(4)
+      },
+      recommendation: this.selectedSide,
+      timestamp: new Date()
+    };
+  }
+}
+
+module.exports = { DualSideExecutor };
