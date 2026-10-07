@@ -14,9 +14,27 @@ class StrategyRunner {
       stopLossPercent: 1.5,
       takeProfitPercent: 2.5,
       payoutMultiplier: 1.8,
+      symbol: 'R_100',
       ...config
     };
     this.executor = new DualSideExecutor();
+  }
+
+  validateRiskProfile({ accountBalance = 1000, cycle = 1 } = {}) {
+    const riskPerTrade = accountBalance * (this.config.riskPercent / 100);
+    const maxDrawdown = accountBalance * (this.config.maxDrawdownPercent / 100);
+    const lossLimit = accountBalance * (this.config.lossLimitPercent / 100);
+    const safe = riskPerTrade <= maxDrawdown && lossLimit > 0;
+
+    return {
+      cycle,
+      accountBalance,
+      riskPerTrade: Number(riskPerTrade.toFixed(4)),
+      maxDrawdown: Number(maxDrawdown.toFixed(4)),
+      lossLimit: Number(lossLimit.toFixed(4)),
+      safe,
+      status: safe ? 'within_limits' : 'risk_limit_exceeded'
+    };
   }
 
   buildDecision({ cycle = 1, currentPrice = 1.1, accountBalance = 1000 }) {
@@ -34,6 +52,7 @@ class StrategyRunner {
 
     const favoredSide = result.recommendation;
     const favoredPlan = favoredSide === 'UP' ? result.upSide : result.downSide;
+    const riskGuard = this.validateRiskProfile({ accountBalance, cycle });
 
     return {
       ...result,
@@ -42,6 +61,7 @@ class StrategyRunner {
       hedgeMode: this.config.hedgeMode,
       autoExecuteFavoredSide: this.config.autoExecuteFavoredSide,
       executedMode: this.config.hedgeMode ? 'HEDGE' : 'FAVORED_SIDE',
+      riskGuard,
       timestamp: new Date().toISOString()
     };
   }
