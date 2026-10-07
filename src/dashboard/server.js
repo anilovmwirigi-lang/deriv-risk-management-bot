@@ -254,6 +254,23 @@ app.post('/api/dual-side', (req, res) => {
   }
 });
 
+app.post('/api/execute', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const payload = {
+      ...body,
+      currentPrice: body.currentPrice ?? 1.1,
+      cycle: body.cycle ?? 1,
+      accountBalance: body.accountBalance ?? accountBalance,
+      preset: body.preset ?? 'balanced'
+    };
+    return app._router ? app._router.handle ? res.json({ status: 'redirected', redirect: '/api/execute-favored-side', payload }) : null : null;
+  } catch (error) {
+    console.error('[Server] Legacy execute error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/execute-favored-side', async (req, res) => {
   try {
     if (!currentPlan) {
