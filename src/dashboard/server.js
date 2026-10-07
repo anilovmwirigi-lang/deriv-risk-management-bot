@@ -2,37 +2,57 @@ const express = require('express');
 const path = require('path');
 const { StrategyRunner } = require('../lib/strategyRunner');
 const { DerivClient } = require('../derivClient');
+const { getPreset, getPresets } = require('../lib/strategyPresets');
+const { TradeJournal } = require('../lib/tradeJournal');
 const config = require('../../config/primacy.config');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DERIV_MODE = process.env.DERIV_MODE || 'demo';
+const journal = new TradeJournal();
 
 let tradeHistory = [];
 let accountBalance = 1000;
 let currentPlan = null;
 let derivClient = null;
 
-const runner = new StrategyRunner({
-  initialStake: config.baseStake || 1,
-  growthRate: config.growthRate || 0.10,
-  riskPercent: config.riskPercent || 2.5,
-  profitTargetPercent: config.profitTargetPercent || 20,
-  lossLimitPercent: config.lossLimitPercent || 10,
-  maxDrawdownPercent: config.maxDrawdownPercent || 12,
-  hedgeMode: false,
-  autoExecuteFavoredSide: true,
-  stopLossPercent: config.stopLossPercent || 1.5,
-  takeProfitPercent: config.takeProfitPercent || 2.5,
-  payoutMultiplier: config.payoutMultiplier || 1.8
-});
+const getRunner = (presetName = 'balanced') => {
+  const preset = getPreset(presetName) || getPreset('balanced');
+  return new StrategyRunner({
+    initialStake: preset.baseStake || config.baseStake || 1,
+    growthRate: preset.growthRate || config.growthRate || 0.10,
+    riskPercent: preset.riskPercent || config.riskPercent || 2.5,
+    profitTargetPercent: preset.profitTargetPercent || config.profitTargetPercent || 20,
+    lossLimitPercent: preset.lossLimitPercent || config.lossLimitPercent || 10,
+    maxDrawdownPercent: preset.maxDrawdownPercent || config.maxDrawdownPercent || 12,
+    hedgeMode: false,
+    autoExecuteFavoredSide: true,
+    stopLossPercent: preset.stopLossPercent || config.stopLossPercent || 1.5,
+    takeProfitPercent: preset.takeProfitPercent || config.takeProfitPercent || 2.5,
+    payoutMultiplier: config.payoutMultiplier || 1.8
+  });
+};
+
+let runner = getRunner();
+
+const recordTrade = (trade) => {
+  const entry = journal.addTrade({
+    ...trade,
+    pnl: Number(trade.pnl ?? 0),
+    status: trade.status || 'simulated',
+    mode: trade.mode || 'demo'
+  });
+  tradeHistory.push(entry);
+  return entry;
+};
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.post('/api/connect', async (req, res) => {
   try {
-    const { mode = DERIV_MODE } = req.body;
+    const { mode = DERIV_MODE, preset = 'balanced' } = req.body;
+    runner = getRunner(preset);
 
     if (mode === 'live') {
       if (!process.env.DERIV_TOKEN) {
@@ -52,23 +72,19 @@ app.post('/api/connect', async (req, res) => {
 
       await derivClient.connect();
       const accountInfo = await derivClient.getAccountInfo();
-
       accountBalance = accountInfo.balance || 1000;
 
-      res.json({
+      return res.json({
         status: 'connected',
         mode: 'live',
         balance: accountBalance,
         currency: accountInfo.currency,
-        email: accountInfo.email
-      });
-    } else {
-      res.json({
-        status: 'connected',
-        mode: 'demo',
-        balance: accountBalance
+        email: accountInfo.email,
+        preset
       });
     }
+
+    return res.json({ status: 'connected', mode: 'demo', balance: accountBalance, preset });
   } catch (error) {
     console.error('[Server] Connection error:', error.message);
     res.status(500).json({ error: error.message });
@@ -77,6 +93,21 @@ app.post('/api/connect', async (req, res) => {
 
 app.get('/api/balance', (req, res) => {
   res.json({ balance: accountBalance, mode: derivClient ? 'live' : 'demo' });
+});
+
+app.get('/api/presets', (req, res) => {
+  res.json({ presets: getPresets() });
+});
+
+app.get('/api/session-summary', (req, res) => {
+  const summary = journal.getSessionSummary({ startBalance: 1000, currentBalance: accountBalance });
+  res.json(summary);
+});
+
+app.get('/api/trades/export', (req, res) => {
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="trades.csv"');
+  res.send(journal.exportCsv());
 });
 
 app.post('/api/plan', (req, res) => {
@@ -93,45 +124,34 @@ app.post('/api/plan', (req, res) => {
       riskPercent = config.riskPercent || 2.5,
       growthRate = config.growthRate || 0.1,
       entryPrice = 1.1,
-      cycle = 1
+      cycle = 1,
+      preset = 'balanced'
     } = req.body;
 
-    const tradeStake = calculateStake({
-      baseStake: stake,
-      growthRate,
-      cycle
-    });
+    const selectedPreset = getPreset(preset) || getPreset('balanced');
+    const activeStake = stake || selectedPreset.baseStake || config.baseStake || 1;
+    const activeGrowth = growthRate || selectedPreset.growthRate || config.growthRate || 0.1;
 
-    const riskPerTrade = calculateRiskPerTrade({
-      accountBalance: tradeStake * 100,
-      riskPercent
-    });
-
-    const profitTarget = calculateProfitTarget({
-      stake: tradeStake,
-      pct: profitTargetPercent
-    });
-
-    const lossLimit = calculateLossLimit({
-      stake: tradeStake,
-      pct: lossLimitPercent
-    });
+    const tradeStake = calculateStake({ baseStake: activeStake, growthRate: activeGrowth, cycle });
+    const riskPerTrade = calculateRiskPerTrade({ accountBalance: tradeStake * 100, riskPercent });
+    const profitTarget = calculateProfitTarget({ stake: tradeStake, pct: profitTargetPercent });
+    const lossLimit = calculateLossLimit({ stake: tradeStake, pct: lossLimitPercent });
 
     currentPlan = buildExecutionPlan({
       stake: tradeStake,
       cycle,
       entryPrice,
-      stopLossPercent: config.stopLossPercent || 1.5,
-      takeProfitPercent: config.takeProfitPercent || 2.5,
+      stopLossPercent: selectedPreset.stopLossPercent || config.stopLossPercent || 1.5,
+      takeProfitPercent: selectedPreset.takeProfitPercent || config.takeProfitPercent || 2.5,
       payoutMultiplier: config.payoutMultiplier || 1.8,
       riskPerTrade,
       profitTarget,
       lossLimit,
-      maxDrawdownPercent: config.maxDrawdownPercent || 12,
-      growthRate
+      maxDrawdownPercent: selectedPreset.maxDrawdownPercent || config.maxDrawdownPercent || 12,
+      growthRate: activeGrowth
     });
 
-    res.json(currentPlan);
+    res.json({ ...currentPlan, preset: selectedPreset.name || preset });
   } catch (error) {
     console.error('[Server] Plan error:', error.message);
     res.status(500).json({ error: error.message });
@@ -140,7 +160,8 @@ app.post('/api/plan', (req, res) => {
 
 app.post('/api/decision', (req, res) => {
   try {
-    const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance } = req.body;
+    const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance, preset = 'balanced' } = req.body;
+    runner = getRunner(preset);
 
     const result = runner.buildDecision({
       cycle,
@@ -165,21 +186,19 @@ app.post('/api/dual-side', (req, res) => {
       profitTargetPercent = config.profitTargetPercent || 20,
       lossLimitPercent = config.lossLimitPercent || 10,
       riskPercent = config.riskPercent || 2.5,
-      growthRate = config.growthRate || 0.1
+      growthRate = config.growthRate || 0.1,
+      preset = 'balanced'
     } = req.body;
 
-    runner.config.initialStake = stake;
-    runner.config.profitTargetPercent = profitTargetPercent;
-    runner.config.lossLimitPercent = lossLimitPercent;
-    runner.config.riskPercent = riskPercent;
-    runner.config.growthRate = growthRate;
+    const selectedPreset = getPreset(preset) || getPreset('balanced');
+    runner = getRunner(preset);
+    runner.config.initialStake = stake || selectedPreset.baseStake || config.baseStake || 1;
+    runner.config.profitTargetPercent = profitTargetPercent || selectedPreset.profitTargetPercent || config.profitTargetPercent || 20;
+    runner.config.lossLimitPercent = lossLimitPercent || selectedPreset.lossLimitPercent || config.lossLimitPercent || 10;
+    runner.config.riskPercent = riskPercent || selectedPreset.riskPercent || config.riskPercent || 2.5;
+    runner.config.growthRate = growthRate || selectedPreset.growthRate || config.growthRate || 0.1;
 
-    const result = runner.buildDecision({
-      cycle,
-      currentPrice,
-      accountBalance: inputBalance
-    });
-
+    const result = runner.buildDecision({ cycle, currentPrice, accountBalance: inputBalance });
     res.json(result);
   } catch (error) {
     console.error('[Server] Dual-side error:', error.message);
@@ -193,29 +212,23 @@ app.post('/api/execute-favored-side', async (req, res) => {
       return res.status(400).json({ error: 'No plan created. Call /api/plan first.' });
     }
 
-    const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance } = req.body;
+    const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance, preset = 'balanced' } = req.body;
+    runner = getRunner(preset);
 
-    const analysis = runner.buildDecision({
-      cycle,
-      currentPrice,
-      accountBalance: inputBalance
-    });
-
+    const analysis = runner.buildDecision({ cycle, currentPrice, accountBalance: inputBalance });
     const side = analysis.favoredSide;
 
     if (derivClient && derivClient.connected) {
       const tradeResult = await derivClient.executeTrade(currentPlan, side);
-
-      tradeHistory.push(tradeResult);
-
-      res.json({
-        trade: tradeResult,
-        analysis,
-        mode: 'live',
-        status: 'executed'
+      const recorded = recordTrade({
+        ...tradeResult,
+        side,
+        pnl: Number((tradeResult.profit || 0).toFixed(4)),
+        status: 'executed',
+        mode: 'live'
       });
 
-      return;
+      return res.json({ trade: recorded, analysis, mode: 'live', status: 'executed' });
     }
 
     const simulatedTrade = {
@@ -228,17 +241,12 @@ app.post('/api/execute-favored-side', async (req, res) => {
       riskReward: currentPlan.riskReward,
       timestamp: new Date().toISOString(),
       status: 'simulated',
-      mode: 'demo'
+      mode: 'demo',
+      pnl: 0
     };
 
-    tradeHistory.push(simulatedTrade);
-
-    res.json({
-      trade: simulatedTrade,
-      analysis,
-      mode: 'demo',
-      status: 'simulated'
-    });
+    const recorded = recordTrade(simulatedTrade);
+    return res.json({ trade: recorded, analysis, mode: 'demo', status: 'simulated' });
   } catch (error) {
     console.error('[Server] Execute error:', error.message);
     res.status(500).json({ error: error.message });
@@ -247,73 +255,51 @@ app.post('/api/execute-favored-side', async (req, res) => {
 
 app.post('/api/execute-hedge', async (req, res) => {
   try {
-    const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance } = req.body;
-
+    const { cycle = 1, currentPrice = 1.1, accountBalance: inputBalance = accountBalance, preset = 'balanced' } = req.body;
+    runner = getRunner(preset);
     runner.config.hedgeMode = true;
 
-    const analysis = runner.buildDecision({
-      cycle,
-      currentPrice,
-      accountBalance: inputBalance
-    });
+    const analysis = runner.buildDecision({ cycle, currentPrice, accountBalance: inputBalance });
 
-    const upTrade = currentPlan
-      ? {
-          symbol: 'EURUSD',
-          side: 'UP',
-          stake: Number((currentPlan.stake * 0.5).toFixed(4)),
-          entryPrice: currentPlan.entryPrice,
-          stopLossPrice: currentPlan.stopLossPrice,
-          takeProfitPrice: currentPlan.takeProfitPrice,
-          timestamp: new Date().toISOString()
-        }
-      : null;
+    const upTrade = currentPlan ? {
+      symbol: 'EURUSD',
+      side: 'UP',
+      stake: Number((currentPlan.stake * 0.5).toFixed(4)),
+      entryPrice: currentPlan.entryPrice,
+      stopLossPrice: currentPlan.stopLossPrice,
+      takeProfitPrice: currentPlan.takeProfitPrice,
+      timestamp: new Date().toISOString(),
+      status: 'simulated',
+      mode: 'demo',
+      pnl: 0
+    } : null;
 
-    const downTrade = currentPlan
-      ? {
-          symbol: 'EURUSD',
-          side: 'DOWN',
-          stake: Number((currentPlan.stake * 0.5).toFixed(4)),
-          entryPrice: currentPlan.entryPrice,
-          stopLossPrice: currentPlan.stopLossPrice,
-          takeProfitPrice: currentPlan.takeProfitPrice,
-          timestamp: new Date().toISOString()
-        }
-      : null;
+    const downTrade = currentPlan ? {
+      symbol: 'EURUSD',
+      side: 'DOWN',
+      stake: Number((currentPlan.stake * 0.5).toFixed(4)),
+      entryPrice: currentPlan.entryPrice,
+      stopLossPrice: currentPlan.stopLossPrice,
+      takeProfitPrice: currentPlan.takeProfitPrice,
+      timestamp: new Date().toISOString(),
+      status: 'simulated',
+      mode: 'demo',
+      pnl: 0
+    } : null;
 
     if (derivClient && derivClient.connected && upTrade && downTrade) {
       const upResult = await derivClient.executeTrade(upTrade, 'UP');
       const downResult = await derivClient.executeTrade(downTrade, 'DOWN');
 
-      tradeHistory.push(upResult);
-      tradeHistory.push(downResult);
+      const a = recordTrade({ ...upResult, pnl: Number((upResult.profit || 0).toFixed(4)), status: 'executed', mode: 'live' });
+      const b = recordTrade({ ...downResult, pnl: Number((downResult.profit || 0).toFixed(4)), status: 'executed', mode: 'live' });
 
-      res.json({
-        trades: [upResult, downResult],
-        analysis,
-        mode: 'live',
-        status: 'executed',
-        strategy: 'hedge'
-      });
-
-      return;
+      return res.json({ trades: [a, b], analysis, mode: 'live', status: 'executed', strategy: 'hedge' });
     }
 
-    const simulatedTrades = [upTrade, downTrade].filter(Boolean).map((t) => ({
-      ...t,
-      status: 'simulated',
-      mode: 'demo'
-    }));
+    const simulatedTrades = [upTrade, downTrade].filter(Boolean).map((t) => recordTrade(t));
 
-    tradeHistory.push(...simulatedTrades);
-
-    res.json({
-      trades: simulatedTrades,
-      analysis,
-      mode: 'demo',
-      status: 'simulated',
-      strategy: 'hedge'
-    });
+    return res.json({ trades: simulatedTrades, analysis, mode: 'demo', status: 'simulated', strategy: 'hedge' });
   } catch (error) {
     console.error('[Server] Hedge error:', error.message);
     res.status(500).json({ error: error.message });
@@ -332,7 +318,8 @@ app.get('/api/config', (req, res) => {
   res.json({
     ...config,
     mode: derivClient ? 'live' : 'demo',
-    connected: derivClient ? derivClient.connected : false
+    connected: derivClient ? derivClient.connected : false,
+    presets: getPresets()
   });
 });
 
