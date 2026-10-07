@@ -32,7 +32,7 @@ class DualSideExecutor {
     const profitTarget = calculateProfitTarget({ stake: tradeStake, pct: profitTargetPercent });
     const lossLimit = calculateLossLimit({ stake: tradeStake, pct: lossLimitPercent });
 
-    const upSideEntry = currentPrice;
+    const upSideEntry = Number(currentPrice);
     const upSideStopLoss = Number((upSideEntry * (1 - stopLossPercent / 100)).toFixed(4));
     const upSideTakeProfit = Number((upSideEntry * (1 + takeProfitPercent / 100)).toFixed(4));
 
@@ -56,7 +56,7 @@ class DualSideExecutor {
     this.upSidePlan.stopLossPrice = upSideStopLoss;
     this.upSidePlan.takeProfitPrice = upSideTakeProfit;
 
-    const downSideEntry = currentPrice;
+    const downSideEntry = Number(currentPrice);
     const downSideStopLoss = Number((downSideEntry * (1 + stopLossPercent / 100)).toFixed(4));
     const downSideTakeProfit = Number((downSideEntry * (1 - takeProfitPercent / 100)).toFixed(4));
 
